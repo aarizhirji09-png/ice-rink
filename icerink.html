@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ice Rink Simulation</title>
+    <script src="https://pygame-web.github.io/archives/0.9/pygbag.js"></script>
+    <style>
+        body { background-color: #1a1a1a; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; overflow: hidden; color: #eee; font-family: sans-serif; }
+        #loading { margin-bottom: 10px; font-weight: bold; color: #44aaff; }
+        canvas { border: 2px solid #333; max-width: 95vw; max-height: 85vh; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading Ice Rink Simulation...</div>
+    <canvas id="canvas" width="1000" height="700"></canvas>
+
+<script type="script/python">
+import pygame
+import sys
+import math
+import random   
+import asyncio
+
+async def main():
+    pygame.init()
+    pygame.font.init()
+    SCREEN = pygame.display.set_mode((1000, 700))
+    
+    # --- ALL ORIGINAL COLORS ---
+    WHITE, BLACK = (255, 255, 255), (10, 10, 10)
+    PANEL_BG, LIGHT_GRAY = (250, 250, 252), (240, 240, 245)
+    GRAY, DARK_GRAY = (205, 205, 210), (60, 60, 70)
+    BLUE, ICE_BASE = (44, 130, 201), (170, 225, 255)
+    WATER_BASE, RED_BOARD = (180, 215, 235), (220, 40, 40)
+    
+    FONT = pygame.font.SysFont("Arial", 15)
+    SMALL = pygame.font.SysFont("Arial", 13)
+    BIG = pygame.font.SysFont("Arial", 32)
+    CLOCK = pygame.time.Clock()
+
+    # --- ALL ORIGINAL STATE & CONSTANTS ---
+    defaults = {
+        "rink_size": 1.0, "spectators": 200, "board_thickness": 0.12,
+        "board_material": "Plastic", "brine": "Propylene Glycol",
+        "ice_additive": "Pure Water", "subsurface": "Concrete", "energy": 1.0
+    }
+    state = defaults.copy()
+    state.update({"frozen_fraction": 1.0, "ice_thickness": 30.0, "ice_temp": -5.0, "melt_rate": 0.0, "time": 0.0, "water_film": 0.0, "water_pool": 0.0})
+
+    BOARD_MATERIALS = ["Metal", "Plastic", "Rubber", "Sponge"]
+    BRINES = ["Propylene Glycol", "Ethylene Glycol", "Calcium Chloride Brine", "Sodium Chloride Brine"]
+    ICE_ADDITIVES = ["Pure Water", "Ice nucleating bacteria", "Ice nucleating protein"]
+    SUBSURFACES = ["Concrete", "Metal", "Gravel/Sand"]
+
+    K_BOARD = {"Metal": 205.0, "Plastic": 0.2, "Rubber": 0.13, "Sponge": 0.04}
+    K_SUBSURF = {"Concrete": 1.7, "Metal": 50.0, "Gravel/Sand": 0.5}
+    BRINE_PROPERTIES = {
+        "Propylene Glycol": {"eff": 1.0, "freeze_dp": -2.0},
+        "Ethylene Glycol": {"eff": 1.3, "freeze_dp": -3.0},
+        "Calcium Chloride Brine": {"eff": 1.7, "freeze_dp": -8.0},
+        "Sodium Chloride Brine": {"eff": 1.15, "freeze_dp": -6.0},
+    }
+    ADDITIVE_EFFECTS = {
+        "Pure Water": {"nucleation": 0.0, "clarity": 0.85, "freeze_boost": 0.0},
+        "Ice nucleating bacteria": {"nucleation": 0.22, "clarity": 0.75, "freeze_boost": 0.12},
+        "Ice nucleating protein": {"nucleation": 0.38, "clarity": 0.95, "freeze_boost": 0.22},
+    }
+    BASE_COP = 3.2
+
+    # --- ALL ORIGINAL UI CLASSES ---
+    class Slider:
+        def __init__(self, x, y, w, label, min_v, max_v, step, getter, setter, fmt="{:.2f}"):
+            self.x, self.y, self.w = x, y, w
+            self.rect = pygame.Rect(x, y, w, 26)
+            self.label, self.min_v, self.max_v, self.step = label, min_v, max_v, step
+            self.get, self.set, self.fmt = getter, setter, fmt
+            self.drag = False
+        def draw(self, surf):
+            v = self.get()
+            surf.blit(SMALL.render(f"{self.label}: {self.fmt.format(v)}", True, BLACK), (self.x, self.y - 18))
+            pygame.draw.rect(surf, GRAY, (self.x, self.y + 8, self.w, 6), border_radius=6)
+            frac = (v - self.min_v) / max(1e-9, (self.max_v - self.min_v))
+            pygame.draw.circle(surf, DARK_GRAY, (int(self.x + frac * self.w), self.y + 11), 8)
+        def handle(self, evt):
+            if evt.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(evt.pos): self.drag = True
+            elif evt.type == pygame.MOUSEBUTTONUP: self.drag = False
+            if self.drag and evt.type in [pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION]:
+                frac = max(0.0, min(1.0, (evt.pos[0] - self.x) / self.w))
+                val = self.min_v + frac * (self.max_v - self.min_v)
+                if self.step: val = round(val / self.step) * self.step
+                self.set(val)
+
+    class Dropdown:
+        def __init__(self, x, y, w, label, options, getter, setter):
+            self.rect = pygame.Rect(x, y, w, 30)
+            self.label, self.options, self.get, self.set = label, options, getter, setter
+        def draw(self, surf):
+            surf.blit(SMALL.render(self.label, True, BLACK), (self.rect.x, self.rect.y - 18))
+            pygame.draw.rect(surf, LIGHT_GRAY, self.rect, border_radius=6)
+            surf.blit(SMALL.render(str(self.get()), True, BLACK), (self.rect.x + 8, self.rect.y + 6))
+        def handle(self, evt):
+            if evt.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(evt.pos):
+                idx = (self.options.index(self.get()) + 1) % len(self.options)
+                self.set(self.options[idx])
+
+    class Button:
+        def __init__(self, x, y, w, h, label, onclick):
+            self.rect = pygame.Rect(x, y, w, h)
+            self.label, self.onclick = label, onclick
+        def draw(self, surf):
+            pygame.draw.rect(surf, DARK_GRAY, self.rect, border_radius=6)
+            surf.blit(SMALL.render(self.label, True, WHITE), (self.rect.x + 10, self.rect.y + 8))
+        def handle(self, evt):
+            if evt.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(evt.pos): self.onclick()
+
+    def reset_defaults():
+        for k in defaults: state[k] = defaults[k]
+        state.update({"frozen_fraction": 1.0, "ice_thickness": 30.0, "ice_temp": -5.0, "melt_rate": 0.0, "water_film": 0.0, "water_pool": 0.0})
+
+    # --- ALL ORIGINAL DRAWING HELPERS ---
+    def make_ph_et_texture(w, h, seed=999):
+        surf = pygame.Surface((w, h), flags=pygame.SRCALPHA)
+        rng = random.Random(seed)
+        for i in range(180):
+            cx, cy, r = rng.randint(0, w), rng.randint(0, h), rng.randint(8, 60)
+            pygame.draw.circle(surf, (255, 255, 255, rng.randint(8, 35)), (cx, cy), r)
+        return surf
+
+    ICE_TEXTURE = make_ph_et_texture(640, 420, seed=42)
+
+    def draw_vertical_gradient(surf, rect, top_col, bottom_col):
+        x, y, w, h = rect
+        for i in range(h):
+            t = i / max(1, h - 1)
+            r = int(top_col[0] * (1 - t) + bottom_col[0] * t)
+            g = int(top_col[1] * (1 - t) + bottom_col[1] * t)
+            b = int(top_col[2] * (1 - t) + bottom_col[2] * t)
+            pygame.draw.line(surf, (r, g, b), (x, y + i), (x + w, y + i))
+
+    def draw_stands(surf, board_rect):
+        sx, sy = board_rect.left + 10, board_rect.top - 90
+        num = min(280, int(state["spectators"] * 0.6 / max(0.1, state["rink_size"])))
+        if num <= 0: return
+        cols, spacing_x, spacing_y = 20, (board_rect.w - 20) / 20, 12
+        for i in range(num):
+            r, c = divmod(i, cols)
+            x, y = int(sx + c * spacing_x), int(sy + r * spacing_y)
+            face = (255, 220, 190) if (i % 3) else (235, 200, 170)
+            shirt = (200, 40, 40) if (i % 4 == 0) else (20, 110, 180)
+            pygame.draw.circle(surf, face, (x, y), 5)
+            pygame.draw.rect(surf, shirt, (x - 5, y + 6, 10, 8))
+
+    # --- THE ENGINE LOGIC ---
+    def compute_step(dt):
+        rink_area = 800.0 * state["rink_size"]
+        brine_eff = BRINE_PROPERTIES.get(state["brine"], {"eff": 1.0})["eff"]
+        load = 0.025 * rink_area + 0.006 * state["spectators"]
+        cop = max(1.0, BASE_COP * brine_eff / (1.0 + 0.0012 * load * max(0.5, 6.0 - state["ice_temp"])))
+        cooling = state["energy"] * cop * (rink_area / 800.0) * 1.4
+        heat = ((75.0 * state["spectators"]) / 15000.0) + (K_BOARD.get(state["board_material"], 1.0) / max(0.01, state["board_thickness"]) * 0.0022 * (rink_area/800.0)) + (K_SUBSURF.get(state["subsurface"], 1.0) * 0.0012 * (rink_area/800.0)) + 0.06
+        add = ADDITIVE_EFFECTS.get(state["ice_additive"], {"freeze_boost": 0.0, "clarity": 1.0})
+        net = (cooling - heat) * (1.0 + add["freeze_boost"] * 0.8)
+
+        if net >= 0:
+            state["ice_thickness"] += net * 8.0 * dt
+            state["melt_rate"] = 0.0
+        else:
+            state["ice_thickness"] += net * 12.0 * dt
+            state["melt_rate"] = min(6.0, -net)
+
+        state["ice_thickness"] = max(0.0, min(120.0, state["ice_thickness"]))
+        state["frozen_fraction"] = max(0.0, min(1.0, (state["ice_thickness"] / 30.0) * add["clarity"]))
+        
+        if net < -0.01: state["water_film"] += min(0.25, (-net) * 0.08) * dt * 6.0 * (1.0 - state["water_film"])
+        else: state["water_film"] -= (0.2 * net * dt if net > 0 else 0.01 * dt)
+        state["water_film"] = max(0.0, min(1.0, state["water_film"]))
+        
+        target_p = state["water_film"] if net < 0 else state["water_film"] * 0.6
+        state["water_pool"] += (target_p - state["water_pool"]) * dt * 0.5
+        state["ice_temp"] += ((-12.0 - 4.0 * add["freeze_boost"] if net > 0.02 else (4.0 + (state["spectators"]/400.0)*3.0 if net < -0.02 else -1.0)) - state["ice_temp"]) * dt * 0.22
+
+    # UI Construction
+    ui = []
+    rx, cy = 660 + 14, 40
+    for name, minv, maxv, step, key, fmt in [("Rink Size", 0.5, 1.3, 0.01, "rink_size", "{:.2f}x"), ("Spectators", 0, 300, 1, "spectators", "{:.0f}"), ("Board Thickness", 0.02, 0.4, 0.01, "board_thickness", "{:.2f}"), ("Energy", 0.0, 1.5, 0.01, "energy", "{:.2f}x")]:
+        ui.append(Slider(rx, cy, 312, name, minv, maxv, step, lambda k=key: state[k], lambda v, k=key: state.update({k: v}), fmt))
+        cy += 64
+    ui.append(Dropdown(rx, cy, 312, "Board Material", BOARD_MATERIALS, lambda: state["board_material"], lambda v: state.update({"board_material": v})))
+    cy += 56
+    ui.append(Dropdown(rx, cy, 312, "Brine", BRINES, lambda: state["brine"], lambda v: state.update({"brine": v})))
+    cy += 56
+    ui.append(Dropdown(rx, cy, 312, "Ice Additive", ICE_ADDITIVES, lambda: state["ice_additive"], lambda v: state.update({"ice_additive": v})))
+    cy += 56
+    ui.append(Dropdown(rx, cy, 312, "Subsurface", SUBSURFACES, lambda: state["subsurface"], lambda v: state.update({"subsurface": v})))
+    cy += 70
+    ui.append(Button(rx, cy, 312, 36, "Reset to Defaults", reset_defaults))
+
+    document.getElementById("loading").style.display = "none"
+    
+    # --- GAME LOOP ---
+    while True:
+        dt = CLOCK.tick(36) / 1000.0
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: return
+            for el in ui: el.handle(event)
+        
+        compute_step(min(0.2, dt))
+        
+        SCREEN.fill((236, 241, 246))
+        rink_rect = pygame.Rect(40, 80, 580, 460)
+        pygame.draw.rect(SCREEN, RED_BOARD, rink_rect.inflate(12, 12), border_radius=12)
+        pygame.draw.rect(SCREEN, WHITE, rink_rect, border_radius=10)
+        
+        # Ice layer
+        ice_rect = rink_rect.inflate(-16, -16)
+        pygame.draw.rect(SCREEN, (170, 225, 255), ice_rect)
+        
+        # Texture
+        tex = pygame.transform.smoothscale(ICE_TEXTURE, (ice_rect.w, ice_rect.h))
+        tex.set_alpha(int(160 * state["frozen_fraction"] + 20))
+        SCREEN.blit(tex, (ice_rect.x, ice_rect.y))
+        
+        # Water layer
+        if state["water_pool"] > 0.01:
+            pw = int(ice_rect.h * state["water_pool"])
+            pygame.draw.rect(SCREEN, (180, 215, 235, 150), (ice_rect.x, ice_rect.y, ice_rect.w, pw))
+
+        draw_stands(SCREEN, rink_rect)
+        pygame.draw.rect(SCREEN, PANEL_BG, (660, 0, 340, 700))
+        for el in ui: el.draw(SCREEN)
+        
+        pygame.display.flip()
+        await asyncio.sleep(0)
+
+asyncio.run(main())
+</script>
+</body>
+</html>
